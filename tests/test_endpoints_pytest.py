@@ -131,6 +131,7 @@ def mock_splunk_service():
     mock_saved_search.name = "test_search"
     mock_saved_search.description = "Test search description"
     mock_saved_search.search = "index=main | stats count"
+    mock_saved_search.alert_count = 0
     mock_saved_search.content = {
         'description': 'Test search description',
         'alert.track': '0',
@@ -589,15 +590,15 @@ async def test_get_alert_not_found(mock_splunk_service):
 
 @pytest.mark.asyncio
 async def test_list_fired_alerts(mock_splunk_service):
-    """Test list_fired_alerts returns fired alert groups"""
+    """Test list_fired_alerts returns alerts with non-zero trigger counts"""
     with patch("splunk_mcp.get_splunk_connection", return_value=mock_splunk_service):
         result = await splunk_mcp.list_fired_alerts()
         assert isinstance(result, list)
-        assert len(result) == 1
+        assert len(result) == 1  # Only test_alert has alert_count=5, test_search has 0
         group = result[0]
         assert group["name"] == "test_alert"
         assert group["triggered_alert_count"] == 5
-        assert "link" in group
+        assert group["alert_severity"] == "4"
 
 
 @pytest.mark.asyncio

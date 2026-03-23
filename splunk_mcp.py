@@ -814,41 +814,48 @@ async def get_alert(alert_name: str) -> Dict[str, Any]:
 @mcp.tool()
 async def list_fired_alerts() -> List[Dict[str, Any]]:
     """
-    List all fired (triggered) alert groups in Splunk.
+    List all alerts that have been triggered (fired) in Splunk.
 
-    Each group represents a saved search that has triggered alerts.
-    Use get_fired_alert_details to see individual alert instances within a group.
+    Scans saved searches for any with a non-zero triggered alert count.
+    Use get_fired_alert_details with the alert name to see individual instances.
 
     Returns:
-        List of fired alert groups with trigger counts
+        List of alerts that have fired, with their trigger counts and severity
     """
     try:
         service = get_splunk_connection()
         logger.info("🔔 Fetching fired alerts...")
 
         fired_alert_groups = []
-        for group in service.fired_alerts:
+        for saved_search in service.saved_searches:
             try:
-                content = group.content if hasattr(group, 'content') else {}
-                group_info = {
-                    "name": group.name,
-                    "triggered_alert_count": int(content.get('triggered_alert_count', 0)),
-                }
+                alert_count = 0
+                try:
+                    alert_count = int(saved_search.alert_count)
+                except (AttributeError, TypeError, ValueError):
+                    pass
 
-                # Try to get the alert link for the group
-                links = group.links if hasattr(group, 'links') else {}
-                if 'alternate' in links:
-                    group_info["link"] = links['alternate']
+                if alert_count == 0:
+                    continue
+
+                content = saved_search.content if hasattr(saved_search, 'content') else {}
+                group_info = {
+                    "name": saved_search.name,
+                    "triggered_alert_count": alert_count,
+                    "search": saved_search.search,
+                    "alert_severity": content.get('alert.severity', ''),
+                    "cron_schedule": content.get('cron_schedule', ''),
+                }
 
                 fired_alert_groups.append(group_info)
             except Exception as e:
-                logger.warning(f"⚠️ Error processing fired alert group {group.name}: {str(e)}")
+                logger.warning(f"⚠️ Error processing saved search {saved_search.name}: {str(e)}")
                 continue
 
         # Sort by count descending
         fired_alert_groups.sort(key=lambda x: x.get('triggered_alert_count', 0), reverse=True)
 
-        logger.info(f"✅ Found {len(fired_alert_groups)} fired alert groups")
+        logger.info(f"✅ Found {len(fired_alert_groups)} alerts with fired instances")
         return fired_alert_groups
 
     except Exception as e:

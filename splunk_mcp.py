@@ -10,7 +10,7 @@ from typing import Dict, List, Any, Optional, Union
 import splunklib.client
 from decouple import config
 from mcp.server.fastmcp import FastMCP
-from splunklib import results
+from splunklib import binding, results
 import sys
 import socket
 from fastapi import FastAPI, APIRouter, Request
@@ -294,6 +294,14 @@ SPLUNK_SCHEME = os.environ.get("SPLUNK_SCHEME", "https")
 SPLUNK_PASSWORD = os.environ.get("SPLUNK_PASSWORD", "admin")
 VERIFY_SSL = config("VERIFY_SSL", default="true", cast=bool)
 SPLUNK_TOKEN = os.environ.get("SPLUNK_TOKEN")  # New: support for token-based auth
+# Hard bounds so a slow/large search or an unresponsive Splunk instance can never
+# hang the tool call indefinitely (which blocks the whole chat pipeline upstream).
+# SPLUNK_SEARCH_MAX_TIME is the dispatch max_time: Splunk auto-finalizes the search
+# job after this many seconds and returns whatever it has computed so far.
+# SPLUNK_TIMEOUT is the socket read timeout backstop for a network-level stall; it
+# MUST be larger than SPLUNK_SEARCH_MAX_TIME so the server-side finalize wins first.
+SPLUNK_SEARCH_MAX_TIME = config("SPLUNK_SEARCH_MAX_TIME", default=60, cast=int)
+SPLUNK_TIMEOUT = config("SPLUNK_TIMEOUT", default=120, cast=int)
 
 def get_splunk_connection() -> splunklib.client.Service:
     """
@@ -311,7 +319,8 @@ def get_splunk_connection() -> splunklib.client.Service:
                 port=SPLUNK_PORT,
                 scheme=SPLUNK_SCHEME,
                 verify=VERIFY_SSL,
-                token=f"Bearer {SPLUNK_TOKEN}"
+                token=f"Bearer {SPLUNK_TOKEN}",
+                handler=binding.handler(timeout=SPLUNK_TIMEOUT, verify=VERIFY_SSL)
             )
         else:
             username = os.environ.get("SPLUNK_USERNAME", "admin")
@@ -322,7 +331,8 @@ def get_splunk_connection() -> splunklib.client.Service:
                 username=username,
                 password=SPLUNK_PASSWORD,
                 scheme=SPLUNK_SCHEME,
-                verify=VERIFY_SSL
+                verify=VERIFY_SSL,
+                handler=binding.handler(timeout=SPLUNK_TIMEOUT, verify=VERIFY_SSL)
             )
         logger.debug(f"✅ Connected to Splunk successfully")
         return service
@@ -361,11 +371,14 @@ async def search_splunk(search_query: str, earliest_time: str = "-24h", latest_t
             "earliest_time": earliest_time,
             "latest_time": latest_time,
             "preview": False,
-            "exec_mode": "blocking"
+            "exec_mode": "blocking",
+            # Auto-finalize the job after SPLUNK_SEARCH_MAX_TIME seconds so a slow
+            # or oversized search returns partial results instead of blocking forever.
+            "max_time": SPLUNK_SEARCH_MAX_TIME
         }
-        
+
         job = service.jobs.create(search_query, **kwargs_search)
-        
+
         # Get the results
         result_stream = job.results(output_mode='json', count=max_results)
         results_data = json.loads(result_stream.read().decode('utf-8'))
@@ -1013,9 +1026,12 @@ async def get_indexes_and_sourcetypes() -> Dict[str, Any]:
             "earliest_time": "-24h",
             "latest_time": "now",
             "preview": False,
-            "exec_mode": "blocking"
+            "exec_mode": "blocking",
+            # Auto-finalize the job after SPLUNK_SEARCH_MAX_TIME seconds so a slow
+            # or oversized search returns partial results instead of blocking forever.
+            "max_time": SPLUNK_SEARCH_MAX_TIME
         }
-        
+
         logger.info("🔍 Executing search for sourcetypes...")
         job = service.jobs.create(search_query, **kwargs_search)
         

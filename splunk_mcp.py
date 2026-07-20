@@ -314,12 +314,15 @@ def get_splunk_connection() -> splunklib.client.Service:
     try:
         if SPLUNK_TOKEN:
             logger.debug(f"🔌 Connecting to Splunk at {SPLUNK_SCHEME}://{SPLUNK_HOST}:{SPLUNK_PORT} using token authentication")
+            # Use splunkToken= so the SDK sends Authorization: Bearer <jwt>.
+            # token= is for session keys and becomes Authorization: Splunk <value>,
+            # which yields "Session is not logged in" for JWT API tokens.
             service = splunklib.client.connect(
                 host=SPLUNK_HOST,
                 port=SPLUNK_PORT,
                 scheme=SPLUNK_SCHEME,
                 verify=VERIFY_SSL,
-                token=f"Bearer {SPLUNK_TOKEN}",
+                splunkToken=SPLUNK_TOKEN,
                 handler=binding.handler(timeout=SPLUNK_TIMEOUT, verify=VERIFY_SSL)
             )
         else:

@@ -4,7 +4,7 @@ import logging
 import os
 import ssl
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Union
 
 import splunklib.client
@@ -343,17 +343,40 @@ def get_splunk_connection() -> splunklib.client.Service:
         logger.error(f"❌ Failed to connect to Splunk: {str(e)}")
         raise
 
+def normalize_splunk_time(value: str) -> str:
+    """
+    Convert absolute ISO-8601 timestamps to epoch seconds so Splunk cannot
+    reinterpret them in the search user's local timezone. A timestamp without
+    timezone info (e.g. "2026-07-29T20:40:00") is treated as UTC. Relative
+    expressions ("-24h", "now", "@d"), epoch values, and anything else
+    non-ISO are passed through unchanged for Splunk to parse.
+    """
+    if not isinstance(value, str):
+        return value
+    candidate = value.strip()
+    if not candidate:
+        return value
+    try:
+        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return str(int(parsed.timestamp()))
+
 @mcp.tool()
 async def search_splunk(search_query: str, earliest_time: str = "-24h", latest_time: str = "now", max_results: int = 100) -> List[Dict[str, Any]]:
     """
     Execute a Splunk search query and return the results.
-    
+
     Args:
         search_query: The search query to execute
-        earliest_time: Start time for the search (default: 24 hours ago)
-        latest_time: End time for the search (default: now)
+        earliest_time: Start time for the search (default: 24 hours ago).
+            Absolute ISO-8601 timestamps without a timezone are treated as UTC.
+        latest_time: End time for the search (default: now).
+            Absolute ISO-8601 timestamps without a timezone are treated as UTC.
         max_results: Maximum number of results to return (default: 100)
-        
+
     Returns:
         List of search results
     """
@@ -371,8 +394,8 @@ async def search_splunk(search_query: str, earliest_time: str = "-24h", latest_t
         
         # Create the search job
         kwargs_search = {
-            "earliest_time": earliest_time,
-            "latest_time": latest_time,
+            "earliest_time": normalize_splunk_time(earliest_time),
+            "latest_time": normalize_splunk_time(latest_time),
             "preview": False,
             "exec_mode": "blocking",
             # Auto-finalize the job after SPLUNK_SEARCH_MAX_TIME seconds so a slow

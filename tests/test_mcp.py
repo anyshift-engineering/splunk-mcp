@@ -416,3 +416,21 @@ async def test_list_tools():
         assert "name" in tool
         assert "description" in tool
         assert "parameters" in tool 
+
+def test_normalize_splunk_time_naive_iso_is_utc():
+    """Timezone-less ISO timestamps must resolve as UTC epoch, not server-local time"""
+    from splunk_mcp import normalize_splunk_time
+    # 2026-07-29T20:40:00 UTC == epoch 1785357600
+    assert normalize_splunk_time("2026-07-29T20:40:00") == "1785357600"
+
+
+def test_normalize_splunk_time_explicit_utc_offset():
+    from splunk_mcp import normalize_splunk_time
+    assert normalize_splunk_time("2026-07-29T20:40:00Z") == "1785357600"
+    assert normalize_splunk_time("2026-07-29T13:40:00-07:00") == "1785357600"
+
+
+def test_normalize_splunk_time_passthrough_relative_and_epoch():
+    from splunk_mcp import normalize_splunk_time
+    for v in ["-24h", "now", "@d", "-90m@m", "1785357600", "rt-30s", ""]:
+        assert normalize_splunk_time(v) == v

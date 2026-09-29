@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 import ssl
 import traceback
 from datetime import datetime, timezone
@@ -303,6 +304,48 @@ SPLUNK_TOKEN = os.environ.get("SPLUNK_TOKEN")  # New: support for token-based au
 SPLUNK_SEARCH_MAX_TIME = config("SPLUNK_SEARCH_MAX_TIME", default=60, cast=int)
 SPLUNK_TIMEOUT = config("SPLUNK_TIMEOUT", default=120, cast=int)
 
+# SPLUNK_ALLOWED_INDEXES is the customer's comma-separated index allowlist for
+# this connection. When set, every search must name only these indexes.
+ALLOWED_INDEXES = {i.strip().lower() for i in os.environ.get("SPLUNK_ALLOWED_INDEXES", "").split(",") if i.strip()}
+
+_INDEX_TERM = re.compile(r'\bindex\s*(!=|=|::)\s*("?)([^\s"()|,]+)\2', re.IGNORECASE)
+_INDEX_IN = re.compile(r'\bindex\s+in\s*\(([^)]*)\)', re.IGNORECASE)
+
+# "Session is not logged in" comes back when Splunk Cloud routes a request to a
+# search head that did not issue the session key; a fresh login usually lands.
+SESSION_RETRIES = 3
+
+
+def _allowed_list() -> str:
+    return ", ".join(sorted(ALLOWED_INDEXES))
+
+
+def check_index_scope(query: str) -> None:
+    """Reject a query that could read an index outside ALLOWED_INDEXES."""
+    if not ALLOWED_INDEXES:
+        return
+    named = []
+    for op, _, name in _INDEX_TERM.findall(query):
+        if op == "!=":
+            raise ValueError(f"index!= is not allowed on this connection; name one of the allowed indexes instead: {_allowed_list()}")
+        named.append(name)
+    for group in _INDEX_IN.findall(query):
+        named += [t.strip().strip('"') for t in group.split(",") if t.strip()]
+    if not named:
+        raise ValueError(f"This Splunk connection may search only these indexes: {_allowed_list()}. Name one of them in the search (index=<name>).")
+    outside = sorted({n for n in named if n.lower() not in ALLOWED_INDEXES})
+    if outside:
+        raise ValueError(f"Index {', '.join(outside)} is outside this connection's allowed indexes ({_allowed_list()}). Search one of those instead.")
+
+
+def index_allowed(name: str) -> bool:
+    return not ALLOWED_INDEXES or name.lower() in ALLOWED_INDEXES
+
+
+def _is_session_error(e: Exception) -> bool:
+    return "not logged in" in str(e).lower()
+
+
 def get_splunk_connection() -> splunklib.client.Service:
     """
     Get a connection to the Splunk service.
@@ -335,6 +378,7 @@ def get_splunk_connection() -> splunklib.client.Service:
                 password=SPLUNK_PASSWORD,
                 scheme=SPLUNK_SCHEME,
                 verify=VERIFY_SSL,
+                autologin=True,
                 handler=binding.handler(timeout=SPLUNK_TIMEOUT, verify=VERIFY_SSL)
             )
         logger.debug(f"✅ Connected to Splunk successfully")
@@ -387,33 +431,41 @@ async def search_splunk(search_query: str, earliest_time: str = "-24h", latest_t
     stripped_query = search_query.lstrip()
     if not (stripped_query.startswith('|') or stripped_query.lower().startswith('search')):
         search_query = f"search {search_query}"
+    check_index_scope(search_query)
+
+    for attempt in range(1, SESSION_RETRIES + 1):
+        try:
+            return _run_search(search_query, earliest_time, latest_time, max_results)
+        except Exception as e:
+            if _is_session_error(e) and attempt < SESSION_RETRIES:
+                logger.warning(f"⚠️ Splunk session rejected, logging in again (attempt {attempt}/{SESSION_RETRIES})")
+                continue
+            logger.error(f"❌ Search failed: {str(e)}")
+            raise
+
+
+def _run_search(search_query: str, earliest_time: str, latest_time: str, max_results: int) -> List[Dict[str, Any]]:
+    service = get_splunk_connection()
+    logger.info(f"🔍 Executing search: {search_query}")
     
-    try:
-        service = get_splunk_connection()
-        logger.info(f"🔍 Executing search: {search_query}")
-        
-        # Create the search job
-        kwargs_search = {
-            "earliest_time": normalize_splunk_time(earliest_time),
-            "latest_time": normalize_splunk_time(latest_time),
-            "preview": False,
-            "exec_mode": "blocking",
-            # Auto-finalize the job after SPLUNK_SEARCH_MAX_TIME seconds so a slow
-            # or oversized search returns partial results instead of blocking forever.
-            "max_time": SPLUNK_SEARCH_MAX_TIME
-        }
+    # Create the search job
+    kwargs_search = {
+        "earliest_time": normalize_splunk_time(earliest_time),
+        "latest_time": normalize_splunk_time(latest_time),
+        "preview": False,
+        "exec_mode": "blocking",
+        # Auto-finalize the job after SPLUNK_SEARCH_MAX_TIME seconds so a slow
+        # or oversized search returns partial results instead of blocking forever.
+        "max_time": SPLUNK_SEARCH_MAX_TIME
+    }
 
-        job = service.jobs.create(search_query, **kwargs_search)
+    job = service.jobs.create(search_query, **kwargs_search)
 
-        # Get the results
-        result_stream = job.results(output_mode='json', count=max_results)
-        results_data = json.loads(result_stream.read().decode('utf-8'))
-        
-        return results_data.get("results", [])
-        
-    except Exception as e:
-        logger.error(f"❌ Search failed: {str(e)}")
-        raise
+    # Get the results
+    result_stream = job.results(output_mode='json', count=max_results)
+    results_data = json.loads(result_stream.read().decode('utf-8'))
+    
+    return results_data.get("results", [])
 
 @mcp.tool()
 async def list_indexes() -> Dict[str, List[str]]:
@@ -425,7 +477,7 @@ async def list_indexes() -> Dict[str, List[str]]:
     """
     try:
         service = get_splunk_connection()
-        indexes = [index.name for index in service.indexes]
+        indexes = [index.name for index in service.indexes if index_allowed(index.name)]
         logger.info(f"📊 Found {len(indexes)} indexes")
         return {"indexes": indexes}
     except Exception as e:
@@ -443,6 +495,8 @@ async def get_index_info(index_name: str) -> Dict[str, Any]:
     Returns:
         Dictionary containing index metadata
     """
+    if not index_allowed(index_name):
+        raise ValueError(f"Index {index_name} is outside this connection's allowed indexes ({_allowed_list()}).")
     try:
         service = get_splunk_connection()
         index = service.indexes[index_name]
@@ -1038,12 +1092,16 @@ async def get_indexes_and_sourcetypes() -> Dict[str, Any]:
         logger.info("📊 Fetching indexes and sourcetypes...")
         
         # Get list of indexes
-        indexes = [index.name for index in service.indexes]
+        indexes = [index.name for index in service.indexes if index_allowed(index.name)]
         logger.info(f"Found {len(indexes)} indexes")
         
-        # Search for sourcetypes across all indexes
-        search_query = """
-        | tstats count WHERE index=* BY index, sourcetype
+        # Search for sourcetypes across all indexes (only the allowed ones when
+        # the connection is restricted; some deployments also refuse index=*)
+        scope = "index=*"
+        if ALLOWED_INDEXES:
+            scope = "index IN (" + ", ".join(sorted(ALLOWED_INDEXES)) + ")"
+        search_query = f"""
+        | tstats count WHERE {scope} BY index, sourcetype
         | stats count BY index, sourcetype
         | sort - count
         """

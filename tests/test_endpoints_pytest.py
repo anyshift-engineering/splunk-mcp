@@ -506,7 +506,9 @@ async def test_search_job_timeout():
 async def test_ping():
     """Test the ping endpoint for server health check"""
     result = await mcp.call_tool("ping", {})
-    result_dict = json.loads(result[0].text)
+    # mcp>=1.10 returns (content, structured) for tools with an output schema
+    content = result[0] if isinstance(result, tuple) else result
+    result_dict = json.loads(content[0].text)
     
     assert result_dict["status"] == "ok"
     assert result_dict["server"] == "splunk-mcp"

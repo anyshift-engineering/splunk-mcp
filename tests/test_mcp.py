@@ -19,6 +19,13 @@ except ImportError:
 # Helper function to extract JSON from TextContent objects
 def extract_json_from_result(result):
     """Extract JSON data from FastMCP TextContent objects or regular dict/list objects"""
+    # mcp>=1.10 returns (content, structured) for tools with an output schema;
+    # list returns are wrapped as {"result": [...]}.
+    if isinstance(result, tuple) and len(result) == 2:
+        structured = result[1]
+        if isinstance(structured, dict) and list(structured) == ["result"]:
+            return structured["result"]
+        return structured
     if hasattr(result, '__iter__') and not isinstance(result, (dict, str)):
         # It's likely a list of TextContent objects
         if len(result) > 0 and hasattr(result[0], 'text'):
